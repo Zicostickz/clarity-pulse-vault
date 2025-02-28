@@ -7,9 +7,11 @@
 (define-constant err-invalid-data (err u102))
 (define-constant err-insufficient-funds (err u103))
 (define-constant err-cooldown-active (err u104))
-(define-constant reward-amount u100) ;; Reward amount in tokens
-(define-constant minimum-data-points u30) ;; Minimum daily entries for rewards
-(define-constant reward-cooldown u86400) ;; 24 hour cooldown
+(define-constant err-rate-limit (err u105))
+(define-constant reward-amount u100)
+(define-constant minimum-data-points u30)
+(define-constant reward-cooldown u86400)
+(define-constant rate-limit-window u3600) ;; 1 hour window
 
 ;; Data structures
 (define-map fitness-data 
@@ -19,105 +21,81 @@
     heart-rate: uint,
     calories: uint,
     device-id: (string-ascii 32),
-    data-hash: (buff 32)
+    data-hash: (buff 32),
+    version: uint
   }
 )
 
-(define-map data-access
-  { owner: principal, viewer: principal }
-  { can-view: bool }
-)
-
-(define-map user-stats
+(define-map submission-rates
   { user: principal }
-  {
-    total-entries: uint,
-    total-rewards: uint,
-    last-reward-date: uint,
-    current-streak: uint
-  }
+  { last-submission: uint, count: uint }
 )
 
-;; SIP-010 Token Interface
-(define-trait ft-trait
-  (
-    (transfer (uint principal principal) (response bool uint))
-    (get-balance (principal) (response uint uint))
+;; Read-only functions
+(define-read-only (get-user-stats (user principal))
+  (default-to
+    { total-entries: u0, total-rewards: u0, last-reward-date: u0, current-streak: u0 }
+    (map-get? user-stats { user: user })
   )
 )
 
-;; Storage functions
-(define-public (store-fitness-data 
-    (timestamp uint)
-    (steps uint)
-    (heart-rate uint)
-    (calories uint)
-    (device-id (string-ascii 32))
-    (data-hash (buff 32)))
+(define-read-only (get-daily-aggregate (user principal) (day-start uint))
+  (let (
+    (day-end (+ day-start u86400))
+    (entries (get-entries-in-range user day-start day-end))
+  )
+    (ok {
+      avg-heart-rate: (calculate-average entries),
+      total-steps: (sum-steps entries),
+      total-calories: (sum-calories entries)
+    })
+  )
+)
+
+;; Enhanced validation
+(define-private (validate-fitness-data
+  (timestamp uint)
+  (steps uint)
+  (heart-rate uint)
+  (calories uint))
   (begin
-    (asserts! (> timestamp u0) err-invalid-data)
+    (asserts! (< timestamp (get-block-time)) err-invalid-data)
     (asserts! (and (> steps u0) (<= steps u100000)) err-invalid-data)
     (asserts! (and (> heart-rate u30) (<= heart-rate u220)) err-invalid-data)
-    (map-set fitness-data
-      { user: tx-sender, timestamp: timestamp }
-      {
-        steps: steps,
-        heart-rate: heart-rate,
-        calories: calories,
-        device-id: device-id,
-        data-hash: data-hash
-      }
-    )
-    (try! (update-user-stats tx-sender timestamp))
+    (asserts! (and (> calories u0) (<= calories u10000)) err-invalid-data)
     (ok true)
   )
 )
 
-;; Stats and rewards
-(define-private (update-user-stats (user principal) (timestamp uint))
+;; Rate limiting
+(define-private (check-rate-limit (user principal))
   (let (
-    (current-stats (default-to 
-      { total-entries: u0, total-rewards: u0, last-reward-date: u0, current-streak: u0 }
-      (map-get? user-stats { user: user }))
-    )
-    (current-entries (+ (get total-entries current-stats) u1))
-    (new-streak (if (is-consecutive-day timestamp (get last-reward-date current-stats))
-                 (+ (get current-streak current-stats) u1)
-                 u1))
+    (current-time (get-block-time))
+    (rate-data (default-to
+      { last-submission: u0, count: u0 }
+      (map-get? submission-rates { user: user })))
   )
-    (begin
-      (map-set user-stats
-        { user: user }
-        {
-          total-entries: current-entries,
-          total-rewards: (get total-rewards current-stats),
-          last-reward-date: timestamp,
-          current-streak: new-streak
-        }
-      )
-      (if (check-reward-eligibility user timestamp current-stats)
-        (distribute-rewards user)
+    (if (> (- current-time (get last-submission rate-data)) rate-limit-window)
+      (begin
+        (map-set submission-rates
+          { user: user }
+          { last-submission: current-time, count: u1 }
+        )
         (ok true)
       )
+      (if (< (get count rate-data) u10)
+        (begin
+          (map-set submission-rates
+            { user: user }
+            { last-submission: (get last-submission rate-data),
+              count: (+ (get count rate-data) u1) }
+          )
+          (ok true)
+        )
+        err-rate-limit
+      )
     )
   )
 )
 
-(define-private (is-consecutive-day (current-time uint) (last-time uint))
-  (and
-    (> current-time last-time)
-    (<= (- current-time last-time) reward-cooldown)
-  )
-)
-
-(define-private (check-reward-eligibility 
-  (user principal) 
-  (timestamp uint)
-  (stats {total-entries: uint, total-rewards: uint, last-reward-date: uint, current-streak: uint}))
-  (and
-    (>= (get total-entries stats) minimum-data-points)
-    (> timestamp (+ (get last-reward-date stats) reward-cooldown))
-  )
-)
-
-[... rest of contract remains unchanged ...]
+[... rest of existing contract functions ...]
