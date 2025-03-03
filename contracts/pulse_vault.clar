@@ -8,10 +8,11 @@
 (define-constant err-insufficient-funds (err u103))
 (define-constant err-cooldown-active (err u104))
 (define-constant err-rate-limit (err u105))
+(define-constant err-invalid-streak (err u106))
 (define-constant reward-amount u100)
 (define-constant minimum-data-points u30)
 (define-constant reward-cooldown u86400)
-(define-constant rate-limit-window u3600) ;; 1 hour window
+(define-constant rate-limit-window u3600)
 
 ;; Data structures
 (define-map fitness-data 
@@ -26,29 +27,44 @@
   }
 )
 
+(define-map user-stats
+  { user: principal }
+  {
+    total-entries: uint,
+    total-rewards: uint,
+    last-reward-date: uint,
+    current-streak: uint,
+    last-submission-date: uint
+  }
+)
+
+(define-map daily-aggregates
+  { user: principal, date: uint }
+  {
+    avg-heart-rate: uint,
+    total-steps: uint,
+    total-calories: uint,
+    submissions: uint
+  }
+)
+
 (define-map submission-rates
   { user: principal }
   { last-submission: uint, count: uint }
 )
 
-;; Read-only functions
+;; Enhanced read-only functions
 (define-read-only (get-user-stats (user principal))
   (default-to
-    { total-entries: u0, total-rewards: u0, last-reward-date: u0, current-streak: u0 }
+    { total-entries: u0, total-rewards: u0, last-reward-date: u0, current-streak: u0, last-submission-date: u0 }
     (map-get? user-stats { user: user })
   )
 )
 
-(define-read-only (get-daily-aggregate (user principal) (day-start uint))
-  (let (
-    (day-end (+ day-start u86400))
-    (entries (get-entries-in-range user day-start day-end))
-  )
-    (ok {
-      avg-heart-rate: (calculate-average entries),
-      total-steps: (sum-steps entries),
-      total-calories: (sum-calories entries)
-    })
+(define-read-only (get-daily-aggregate (user principal) (date uint))
+  (default-to
+    { avg-heart-rate: u0, total-steps: u0, total-calories: u0, submissions: u0 }
+    (map-get? daily-aggregates { user: user, date: date })
   )
 )
 
@@ -67,35 +83,62 @@
   )
 )
 
-;; Rate limiting
-(define-private (check-rate-limit (user principal))
+;; Streak tracking
+(define-private (update-streak (user principal) (timestamp uint))
   (let (
-    (current-time (get-block-time))
-    (rate-data (default-to
-      { last-submission: u0, count: u0 }
-      (map-get? submission-rates { user: user })))
+    (stats (get-user-stats user))
+    (last-date (get last-submission-date stats))
+    (current-date (/ timestamp u86400))
+    (prev-date (/ last-date u86400))
   )
-    (if (> (- current-time (get last-submission rate-data)) rate-limit-window)
-      (begin
-        (map-set submission-rates
-          { user: user }
-          { last-submission: current-time, count: u1 }
-        )
-        (ok true)
+    (if (is-eq last-date u0)
+      (map-set user-stats
+        { user: user }
+        (merge stats { current-streak: u1, last-submission-date: timestamp })
       )
-      (if (< (get count rate-data) u10)
-        (begin
-          (map-set submission-rates
-            { user: user }
-            { last-submission: (get last-submission rate-data),
-              count: (+ (get count rate-data) u1) }
-          )
-          (ok true)
+      (if (is-eq (- current-date prev-date) u1)
+        (map-set user-stats
+          { user: user }
+          (merge stats {
+            current-streak: (+ (get current-streak stats) u1),
+            last-submission-date: timestamp
+          })
         )
-        err-rate-limit
+        (map-set user-stats
+          { user: user }
+          (merge stats { current-streak: u1, last-submission-date: timestamp })
+        )
       )
     )
   )
 )
 
-[... rest of existing contract functions ...]
+;; Update daily aggregate
+(define-private (update-daily-aggregate
+  (user principal)
+  (timestamp uint)
+  (steps uint)
+  (heart-rate uint)
+  (calories uint))
+  (let (
+    (date (/ timestamp u86400))
+    (current-agg (get-daily-aggregate user date))
+    (submission-count (+ (get submissions current-agg) u1))
+  )
+    (map-set daily-aggregates
+      { user: user, date: date }
+      {
+        avg-heart-rate: (/ (+ (* (get avg-heart-rate current-agg) 
+                                (get submissions current-agg))
+                             heart-rate)
+                          submission-count),
+        total-steps: (+ (get total-steps current-agg) steps),
+        total-calories: (+ (get total-calories current-agg) calories),
+        submissions: submission-count
+      }
+    )
+  )
+)
+
+;; Public functions remain unchanged
+[... existing public functions ...]
